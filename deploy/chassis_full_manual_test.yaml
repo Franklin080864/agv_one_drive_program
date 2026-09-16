@@ -1,0 +1,82 @@
+agv2_control_node:
+  ros__parameters:
+    chassis:
+      front_wheel_x: 0.155
+      front_wheel_y: -0.169
+      rear_wheel_x: -0.155
+      rear_wheel_y: 0.169
+      wheel_radius: 0.07
+      front_motor_direction: -1
+      rear_motor_direction: 1
+      front_steer_direction: -1
+      rear_steer_direction: -1
+
+    can:
+      steer_front_id: 322
+      steer_rear_id: 321
+      wheel_front_id: 513
+      wheel_rear_id: 514
+      wheel_front_status_id: 385
+      wheel_rear_status_id: 386
+      sdo_front_id: 1537
+      sdo_rear_id: 1538
+      front_node_id: 1
+      rear_node_id: 2
+      # Match the pre-safety-tuning agv2_pkg A4 speed field.
+      steer_speed_field: 300
+
+    wheel_bringup:
+      wait_for_can_sender: true
+      can_sender_node_name: socket_can_sender
+      sdo_retry_period_ms: 1000
+      status_stale_ms: 500
+      warn_period_ms: 2000
+
+    # Match the previous agv2_pkg motion limits.
+    limits:
+      max_linear_speed: 0.5
+      max_angular_speed: 0.5
+      max_steer_angle: 1.5708
+      max_wheel_rpm: 200.0
+      singularity_speed: 0.001
+
+    rate_limit:
+      loop_hz: 20.0
+      max_d_speed_per_step: 0.05
+
+    fsm:
+      cmd_watchdog_ms: 200
+      lock_settle_ms: 100
+      stop_speed_eps: 0.005
+
+    arbitrator:
+      input_timeout_ms: 1000
+
+    diagnostics:
+      wheel_feedback_timeout_ms: 500
+      steer_feedback_timeout_ms: 300
+      steer_loopback_window_ms: 50
+      expect_tx_loopback: true
+      min_motion_command_mps: 0.05
+      steer_mismatch_deg: 8.0
+
+    joystick:
+      enable_button: 8
+      ad_enable_button: 9
+      emergency_button: 7
+      left_linear_axis: 1
+      left_angular_axis: 0
+      left_linear_sign: 1.0
+      left_angular_sign: 1.0
+      speed_axis: 7
+      angular_axis: 2
+      angular_left_button: 3
+      angular_right_button: 1
+      wheel_spd_up_button: 4
+      wheel_spd_down_button: 0
+      heartbeat_timeout_s: 0.5
+      teleop_max_speed: 0.3
+      teleop_rotate_speed: 0.5
+      teleop_rotate_omega: 0.87
+      teleop_steer_lock: 1.5708
+      teleop_deadband: 0.1

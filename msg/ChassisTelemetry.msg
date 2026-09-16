@@ -1,0 +1,79 @@
+std_msgs/Header header
+
+uint8 MODE_IDLE=0
+uint8 MODE_TELEOP=1
+uint8 MODE_AUTO=2
+
+uint8 FSM_NORMAL=0
+uint8 FSM_RAMP_DOWN=1
+uint8 FSM_LOCKED=2
+
+uint8 SOURCE_NONE=0
+uint8 SOURCE_CMD_VEL=1
+uint8 SOURCE_WHEEL_COMMAND=2
+uint8 SOURCE_TELEOP=3
+
+uint32 FAULT_FRONT_WHEEL_FEEDBACK_TIMEOUT=1
+uint32 FAULT_REAR_WHEEL_FEEDBACK_TIMEOUT=2
+uint32 FAULT_FRONT_WHEEL_DRIVE=4
+uint32 FAULT_REAR_WHEEL_DRIVE=8
+uint32 FAULT_FRONT_WHEEL_NO_MOTION=16
+uint32 FAULT_REAR_WHEEL_NO_MOTION=32
+uint32 FAULT_FRONT_STEER_FEEDBACK_TIMEOUT=64
+uint32 FAULT_REAR_STEER_FEEDBACK_TIMEOUT=128
+uint32 FAULT_FRONT_STEER_MISMATCH=256
+uint32 FAULT_REAR_STEER_MISMATCH=512
+uint32 FAULT_CAN_ERROR_FRAME=1024
+
+uint8 mode
+uint8 fsm_state
+uint8 active_source
+bool have_input
+
+uint32 steer_front_can_id
+uint32 steer_rear_can_id
+uint32 wheel_front_command_can_id
+uint32 wheel_rear_command_can_id
+uint32 wheel_front_status_can_id
+uint32 wheel_rear_status_can_id
+
+# Requested values are the selected input after hard limits, before FSM stop logic.
+float64 requested_front_steer_rad
+float64 requested_rear_steer_rad
+float64 requested_front_speed_mps
+float64 requested_rear_speed_mps
+
+# Commanded values are the post-FSM, post-rate-limit values used to build CAN frames.
+float64 commanded_front_steer_rad
+float64 commanded_rear_steer_rad
+float64 commanded_front_speed_mps
+float64 commanded_rear_speed_mps
+
+bool front_wheel_feedback_seen
+bool rear_wheel_feedback_seen
+uint64 front_wheel_feedback_count
+uint64 rear_wheel_feedback_count
+int64 front_wheel_feedback_age_ms
+int64 rear_wheel_feedback_age_ms
+uint16 front_wheel_status_word
+uint16 rear_wheel_status_word
+uint16 front_wheel_error_code
+uint16 rear_wheel_error_code
+int32 front_wheel_actual_velocity_raw
+int32 rear_wheel_actual_velocity_raw
+
+bool front_steer_feedback_seen
+bool rear_steer_feedback_seen
+uint64 front_steer_feedback_count
+uint64 rear_steer_feedback_count
+uint64 front_steer_loopback_count
+uint64 rear_steer_loopback_count
+int64 front_steer_feedback_age_ms
+int64 rear_steer_feedback_age_ms
+float64 front_steer_feedback_deg
+float64 rear_steer_feedback_deg
+float64 front_steer_error_deg
+float64 rear_steer_error_deg
+
+uint64 can_error_frame_count
+uint32 diagnostic_flags

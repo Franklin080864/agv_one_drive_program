@@ -1,0 +1,12 @@
+/**:
+  ros__parameters:
+    auto_request_topic: /agv/auto_request
+    joy_topic: /joy
+    publish_hz: 30.0
+    # Match chassis.yaml joystick.ad_enable_button / emergency_button.
+    auto_button_index: 9
+    emergency_button_index: 7
+    joy_button_count: 12
+    joy_axis_count: 8
+    lock_service_name: /agv2/lock
+    call_lock_on_disable: true

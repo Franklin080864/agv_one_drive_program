@@ -1,0 +1,100 @@
+#include "agv2_pkg/wheel_bringup.hpp"
+
+namespace agv2_pkg {
+
+void note_wheel_status(WheelBringupState& state, int64_t now_ms) {
+  state.status_seen = true;
+  state.last_status_ms = now_ms;
+}
+
+bool is_wheel_status_stale(const WheelBringupState& state,
+                           const WheelBringupConfig& cfg,
+                           int64_t now_ms) {
+  if (!state.status_seen) return true;
+  if (cfg.status_stale_ms <= 0) return false;
+  return (now_ms - state.last_status_ms) > cfg.status_stale_ms;
+}
+
+namespace {
+
+bool should_emit_periodic(int64_t last_ms, int64_t period_ms, int64_t now_ms) {
+  if (last_ms < 0) return true;
+  if (period_ms <= 0) return true;
+  return (now_ms - last_ms) >= period_ms;
+}
+
+bool should_warn(WheelBringupState& state,
+                 const WheelBringupConfig& cfg,
+                 int64_t now_ms) {
+  if (cfg.warn_period_ms < 0) return false;
+  if (!should_emit_periodic(state.last_warn_ms, cfg.warn_period_ms, now_ms)) {
+    return false;
+  }
+  state.last_warn_ms = now_ms;
+  return true;
+}
+
+}  // namespace
+
+WheelBringupDecision update_wheel_bringup(WheelBringupState& state,
+                                          const WheelStatus& status,
+                                          const WheelBringupConfig& cfg,
+                                          bool can_sender_ready,
+                                          int64_t now_ms) {
+  WheelBringupDecision out;
+  out.status_stale = is_wheel_status_stale(state, cfg, now_ms);
+
+  if (cfg.wait_for_can_sender && !can_sender_ready) {
+    out.phase = WheelBringupPhase::WaitingForCanSender;
+    out.warn = should_warn(state, cfg, now_ms);
+    return out;
+  }
+
+  if (!state.status_seen &&
+      should_emit_periodic(state.last_sdo_ms, cfg.sdo_retry_period_ms, now_ms)) {
+    out.send_sdo_init = true;
+    state.last_sdo_ms = now_ms;
+    ++state.sdo_retry_count;
+  }
+
+  if (!status.ready) {
+    out.phase = WheelBringupPhase::Shutdown;
+    out.send_controlword = true;
+    out.controlword_step = 0;
+  } else if (!status.switched_on) {
+    out.phase = WheelBringupPhase::SwitchOn;
+    out.send_controlword = true;
+    out.controlword_step = 1;
+  } else if (!status.enabled) {
+    out.phase = WheelBringupPhase::EnableOperation;
+    out.send_controlword = true;
+    out.controlword_step = 2;
+  } else {
+    out.phase = WheelBringupPhase::Enabled;
+    out.allow_velocity = true;
+  }
+
+  if ((!state.status_seen || out.status_stale || !status.enabled) &&
+      should_warn(state, cfg, now_ms)) {
+    out.warn = true;
+  }
+  return out;
+}
+
+const char* wheel_bringup_phase_name(WheelBringupPhase phase) {
+  switch (phase) {
+    case WheelBringupPhase::WaitingForCanSender:
+      return "waiting_for_can_sender";
+    case WheelBringupPhase::Shutdown:
+      return "shutdown";
+    case WheelBringupPhase::SwitchOn:
+      return "switch_on";
+    case WheelBringupPhase::EnableOperation:
+      return "enable_operation";
+    case WheelBringupPhase::Enabled:
+      return "enabled";
+  }
+  return "unknown";
+}
+
+}  // namespace agv2_pkg

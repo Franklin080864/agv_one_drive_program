@@ -1,0 +1,93 @@
+agv2_control_node:
+  ros__parameters:
+    chassis:
+      # Wheel positions in base_link [m]. First-pass estimates; recalibrate on real robot.
+      front_wheel_x: 0.155
+      front_wheel_y: -0.169
+      rear_wheel_x: -0.155
+      rear_wheel_y: 0.169
+      wheel_radius: 0.07        # [m], used for m/s <-> RPM conversion
+      # Mechanical motor mounting orientation. -1 if motor's positive rotation
+      # corresponds to body-rear motion; +1 if it matches body-forward.
+      front_motor_direction: -1
+      rear_motor_direction: 1
+      # Steering motor mounting orientation. +1 if a positive steering command
+      # turns the wheel toward body-left; -1 if the hardware sign is reversed.
+      front_steer_direction: -1
+      rear_steer_direction: -1
+
+    can:
+      # Default robot-1 CAN mapping. Values are decimal to keep ROS parameter
+      # parsing portable; comments show the wire IDs in hex.
+      steer_front_id: 322          # 0x142
+      steer_rear_id: 321           # 0x141
+      wheel_front_id: 513          # 0x201
+      wheel_rear_id: 514           # 0x202
+      wheel_front_status_id: 385   # 0x181
+      wheel_rear_status_id: 386    # 0x182
+      sdo_front_id: 1537           # 0x601
+      sdo_rear_id: 1538            # 0x602
+      front_node_id: 1
+      rear_node_id: 2
+      # A4 bytes 2-3; validated with Teleop and direct cmd_vel on 2026-09-16.
+      steer_speed_field: 300
+
+    wheel_bringup:
+      wait_for_can_sender: true
+      # Only this subscriber counts as the real CAN sender. Rosbag also
+      # subscribes /to_can_bus and must not trigger one-shot bring-up frames.
+      can_sender_node_name: socket_can_sender
+      sdo_retry_period_ms: 1000
+      status_stale_ms: 500
+      warn_period_ms: 2000
+
+    limits:
+      max_linear_speed: 0.5     # m/s, cap on |vx| and |vy| from cmd_vel
+      max_angular_speed: 0.5    # rad/s, cap on |omega|
+      max_steer_angle: 1.5708   # rad, hard limit on each steering angle (pi/2)
+      max_wheel_rpm: 200.0        # hard cap before CAN encoding
+      singularity_speed: 0.001  # m/s, below this hold last steering angle
+
+    rate_limit:
+      loop_hz: 20.0
+      max_d_speed_per_step: 0.05    # m/s/frame -> 1 m/s/s @ 20 Hz
+
+    fsm:
+      cmd_watchdog_ms: 200      # any input older than this -> RampDown
+      lock_settle_ms: 100
+      stop_speed_eps: 0.005     # m/s, both wheels below this -> "stopped"
+
+    arbitrator:
+      input_timeout_ms: 1000    # single-source must be silent this long for another to take over
+
+    diagnostics:
+      # Passive logging only. These thresholds set telemetry flags and never
+      # alter chassis commands or mode.
+      wheel_feedback_timeout_ms: 500
+      steer_feedback_timeout_ms: 300
+      steer_loopback_window_ms: 50
+      expect_tx_loopback: true
+      min_motion_command_mps: 0.05
+      steer_mismatch_deg: 8.0
+
+    joystick:
+      # Button / axis indices for the new (post-2024) gamepad layout.
+      enable_button: 8
+      ad_enable_button: 9
+      emergency_button: 7
+      left_linear_axis: 1     # left stick up/down -> vx
+      left_angular_axis: 0    # left stick left/right -> omega
+      left_linear_sign: 1.0   # flip to -1.0 if pushing up drives backward
+      left_angular_sign: 1.0  # flip to -1.0 if left/right yaw is reversed
+      speed_axis: 7
+      angular_axis: 2
+      angular_left_button: 3
+      angular_right_button: 1
+      wheel_spd_up_button: 4
+      wheel_spd_down_button: 0
+      heartbeat_timeout_s: 0.5  # joy heartbeat (matches old agv_pkg behavior)
+      teleop_max_speed: 0.3     # m/s, ceiling for joystick mode
+      teleop_rotate_speed: 0.5  # legacy m/s fallback if teleop_rotate_omega is omitted
+      teleop_rotate_omega: 0.87 # rad/s, body yaw rate for geometry-based rotate-in-place
+      teleop_steer_lock: 1.5708 # rad, +/- 90 deg for sideways/rotate
+      teleop_deadband: 0.1
