@@ -7,7 +7,7 @@ ROS 2 Humble、1 Mbps SocketCAN 和标准 Linux joystick。
 
 ```bash
 mkdir -p ~/agv/agv_ws/src
-git clone https://github.com/Franklin080864/agv_one_drive_programme.git \
+git clone https://github.com/Franklin080864/agv_one_drive_program.git \
   ~/agv/agv_ws/src/agv2_pkg
 
 cd ~/agv/agv_ws/src/agv2_pkg
