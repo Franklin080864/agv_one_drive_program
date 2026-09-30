@@ -434,6 +434,39 @@ class TestNodeSafety(unittest.TestCase):
         response = self._service(self.shutdown_client)
         self.assertFalse(response.success, response.message)
 
+        # A failed delivery attempt is still a shutdown request. Restoring the
+        # transport must not let a queued/new operator enable restart motion.
+        self._attach_sender()
+        self._until(lambda: self.diagnostics.get("can_sender_ready") == "true" and
+                    self.latest.front_wheel_feedback_age_ms < 100 and
+                    self.latest.rear_wheel_feedback_age_ms < 100,
+                    description="CAN sender and healthy feedback restored after failed shutdown")
+        self.buttons[9] = 1
+
+        def check(message):
+            self._assert_stopped(message)
+            self.assertEqual(message.mode, ChassisTelemetry.MODE_IDLE)
+
+        self._observe_ticks(6, check)
+        response = self._service(self.reset_client)
+        self.assertFalse(response.success,
+                         "pending shutdown must reject fault reset: " + response.message)
+        response = self._service(self.recovery_client)
+        self.assertFalse(response.success,
+                         "pending shutdown must reject transport recovery: " + response.message)
+        self._observe_ticks(3, check)
+
+        retry_started = time.monotonic()
+        response = self._service(self.shutdown_client)
+        self.assertTrue(response.success, response.message + self._failure_context())
+        self._until(lambda: any(stamp >= retry_started and frame.id == 0x001 and
+                                bytes(frame.data) == bytes([0xFF] * 7 + [0xFD])
+                                for stamp, frame in self.can_frames) and
+                    all(any(frame.id == can_id and self._encoded_speed(frame) == 0.0
+                            for _, frame in self._wheel_frames(retry_started))
+                        for can_id in (0x201, 0x202)),
+                    description="shutdown retry delivers both zero targets and terminator")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -107,7 +107,7 @@ class Agv2Control : public rclcpp::Node {
         "agv2/reinitialize_transport",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
-          if (mode_ != Mode::Idle || shutdown_prepared_ || g_shutdown_requested.load() ||
+          if (mode_ != Mode::Idle || shutdown_pending_ || g_shutdown_requested.load() ||
               !actuation_ever_started_ || !can_sender_ready_for_bringup()) {
             res->success = false;
             res->message = "requires an already-started, locked chassis and a connected CAN sender";
@@ -149,6 +149,10 @@ class Agv2Control : public rclcpp::Node {
                std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
           {
             std::lock_guard<std::mutex> lk(mu_);
+            // A failed delivery attempt must not let a queued enable edge
+            // restore motion after the synchronous DDS wait returns.
+            shutdown_pending_ = true;
+            recovery_requested_ = false;
             stop_motion("shutdown_requested");
           }
 
@@ -440,8 +444,9 @@ class Agv2Control : public rclcpp::Node {
     if (action == JoyEnableAction::TeleopRejected) {
       RCLCPP_WARN(get_logger(), "Joy: enable rejected; axes 0-3 not neutral.");
     } else if (action == JoyEnableAction::TeleopEnable || action == JoyEnableAction::AutoEnable) {
-      if (fault_latch_.latched() != 0 || shutdown_prepared_ || invalid_sources_ != 0) {
-        RCLCPP_WARN(get_logger(), "Enable rejected: clear faults/invalid input before rearming.");
+      if (fault_latch_.latched() != 0 || shutdown_pending_ ||
+          g_shutdown_requested.load() || invalid_sources_ != 0) {
+        RCLCPP_WARN(get_logger(), "Enable rejected: shutdown pending or unresolved faults/invalid input.");
       } else {
         stop_motion("enabled_waiting_input");
         mode_ = action == JoyEnableAction::TeleopEnable ? Mode::Teleop : Mode::Auto;
@@ -654,6 +659,16 @@ class Agv2Control : public rclcpp::Node {
     // both steering positions are known, and the real CAN sender is present.
     if (!startup_interlock_released || !can_sender_ready) {
       state_.v_front = state_.v_rear = 0.0;
+      return;
+    }
+    if (shutdown_pending_) {
+      // An unconfirmed terminator may already have reached the drives. Do not
+      // undo it with bring-up or enable-operation frames while awaiting retry.
+      state_.v_front = state_.v_rear = 0.0;
+      if (actuation_ever_started_) {
+        can_pub_->publish(encode_wheel_controlword(can_ids_.wheel_front, 0));
+        can_pub_->publish(encode_wheel_controlword(can_ids_.wheel_rear, 0));
+      }
       return;
     }
     if (fault_latch_.latched() != 0) {
@@ -908,7 +923,7 @@ class Agv2Control : public rclcpp::Node {
   }
 
   void reset_faults(std_srvs::srv::Trigger::Response& response) {
-    if (shutdown_prepared_ || g_shutdown_requested.load() || joy_gate_.emergency_active()) {
+    if (shutdown_pending_ || g_shutdown_requested.load() || joy_gate_.emergency_active()) {
       response.success = false;
       response.message = "cannot reset during shutdown or while software emergency is held";
       return;
@@ -1031,6 +1046,7 @@ class Agv2Control : public rclcpp::Node {
     add("active_faults", std::to_string(current_faults()));
     add("latched_faults", std::to_string(fault_latch_.latched()));
     add("stop_reason", shutdown_prepared_ ? "shutdown_prepared" : stop_reason_);
+    add("shutdown_pending", shutdown_pending_ ? "true" : "false");
     add("can_sender_ready", can_sender_ready_for_bringup() ? "true" : "false");
     add("startup_interlock_released", startup_interlock_released_ ? "true" : "false");
     add("hardware_monitor_armed", hardware_monitor_armed_ ? "true" : "false");
@@ -1431,6 +1447,7 @@ class Agv2Control : public rclcpp::Node {
   bool steering_brought_up_{false};
   bool startup_interlock_released_{false};
   bool shutdown_processed_{false};
+  bool shutdown_pending_{false};
   bool shutdown_prepared_{false};
 };
 

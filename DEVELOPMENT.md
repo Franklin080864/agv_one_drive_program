@@ -43,6 +43,8 @@
 
 `shutdown.ack_timeout_ms` 默认 4000 ms（有效范围 1–60000 ms）。Humble 所用 Fast DDS 的默认可靠通信心跳为 3 秒，500 ms 可能把已收到的消息误判为未确认。停车帧在等待前立即发送；超时或中间件不支持确认时返回失败并保持控制锁定。此确认仅覆盖 DDS 接收，不能证明 CAN 已发送或轮子已停。若增大该参数，应同步增大停机脚本的 `AGV_SHUTDOWN_TIMEOUT_S`，为发现服务和响应留出余量。参考 [Fast DDS WriterTimes](https://fast-dds.docs.eprosima.com/en/2.6.x/fastdds/dds_layer/core/policy/eprosimaExtensions.html#writertimes)。
 
+一旦请求停机，`shutdown_pending=true` 会持续禁止使能、故障复位和通信重初始化；确认失败时仍保持该门控，恢复 CAN sender 后可重试停机服务。正常退出并重新启动节点后才能开始新的运行会话，避免等待期间排队的输入意外恢复运动。
+
 `active_faults` 与 `latched_faults` 是十进制位掩码，`DiagnosticStatus.message` 同时提供可读名称：
 
 | 位值 | 名称 |
@@ -103,7 +105,7 @@ sudo ./deploy/stop_agv.sh --domain-id 11
 
 默认 session 为 `agv_control`，接口为 `can0`；可用 `--session`、`--interface` 指定。启动会记录 Domain/CAN/参数文件。重复启动同一实例或发现已管理实例冲突时拒绝操作，不再杀掉旧实例。旧版本创建且没有元数据的 session 不能由新停机脚本猜测归属；请先使用原版本停机流程完成迁移。
 
-ROS 图就绪检查仅表示进程和接口出现，不表示电机可运动。启动失败保留 session/CAN 供检查；停机拒绝或超时同样保留。`AGV_STARTUP_TIMEOUT_S` 默认 30，`AGV_SHUTDOWN_TIMEOUT_S` 默认 15。
+ROS 图就绪检查仅表示进程和接口出现，不表示电机可运动。创建实例后的启动失败保留 session/CAN 供检查；停机拒绝或超时同样保留。`AGV_STARTUP_TIMEOUT_S` 默认 30 秒，`AGV_SHUTDOWN_TIMEOUT_S` 默认 10 秒；后者覆盖服务发现与响应等待，外层进程超时额外预留 5 秒。
 
 回退前先用当前版本完成停机并确认车辆实际停止，再切回 `main`、重新构建，使用原分支脚本及原验证参数。不要在运行中的控制进程上切换版本。
 

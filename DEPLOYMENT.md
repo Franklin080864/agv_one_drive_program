@@ -10,7 +10,7 @@ ROS 2 Humble、1 Mbps SocketCAN 和标准 Linux joystick。
 
 ```bash
 mkdir -p ~/agv/agv_ws/src
-git clone https://github.com/Franklin080864/agv_one_drive_program.git \
+git clone --branch develop https://github.com/Franklin080864/agv_one_drive_program.git \
   ~/agv/agv_ws/src/agv2_pkg
 
 cd ~/agv/agv_ws/src/agv2_pkg
@@ -75,11 +75,14 @@ sudo ./deploy/stop_agv.sh --domain-id 11
 ```
 
 停机脚本读取本实例的 Domain/CAN，调用 `/agv2/prepare_shutdown` 并检查响应
-`success`，只有明确成功后才关闭 tmux 并将 CAN 接口置为 DOWN。拒绝、超时或
-通信异常时保留现场。DDS 确认不等于实际制动确认；最终仍须确认车辆实际停止，
+`success`，只有明确成功后才先将 CAN 接口置为 DOWN，再关闭 tmux。接口操作
+失败会保留 session 元数据供重试；服务拒绝、超时或通信异常时保留现场。
+DDS 确认不等于实际制动确认；最终仍须确认车辆实际停止，
 并看到 `state DOWN` 和 `can state STOPPED`。
 
 ## 更新
+
+先按上述停机步骤停止当前实例，并确认车辆实际停止，再更新 `develop`：
 
 ```bash
 cd ~/agv/agv_ws/src/agv2_pkg

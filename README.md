@@ -67,7 +67,7 @@ ros2 service call /agv2/save_fault_log std_srvs/srv/Trigger "{}"
 离线生成电机定位报告：
 
 ```bash
-ros2 run agv2_pkg analyze_chassis_bag \
+ros2 run agv2_pkg analyze_chassis_bag.py \
   ~/agv/agv_ws/data/chassis_faults/chassis_fault_YYYYMMDD_HHMMSS
 ```
 
