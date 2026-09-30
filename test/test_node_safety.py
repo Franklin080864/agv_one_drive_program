@@ -2,7 +2,7 @@
 """ROS 2 black-box safety regression tests; no SocketCAN device is opened.
 
 Run after building and sourcing this package:
-  python3 -m unittest -v test/test_node_safety.py
+  python3 -m unittest discover -v -s test -p test_node_safety.py
 
 Each test starts a new driver in an isolated namespace. This process emulates
 the SocketCAN sender subscription and feeds synthetic CAN feedback, so tests

@@ -44,12 +44,12 @@ jobs:
             --ctest-args -R '^test_' --output-on-failure
           colcon test-result --verbose
       - name: Shutdown client contract tests
-        run: python3 -m unittest -v test/test_prepare_chassis_shutdown.py
+        run: python3 -m unittest discover -v -s test -p test_prepare_chassis_shutdown.py
       - name: ROS node fault-injection tests (simulated CAN only)
         run: |
           source /opt/ros/humble/setup.bash
           source install/setup.bash
-          python3 -m unittest -v test/test_node_safety.py
+          python3 -m unittest discover -v -s test -p test_node_safety.py
       - name: Retain test logs
         if: always()
         uses: actions/upload-artifact@v4

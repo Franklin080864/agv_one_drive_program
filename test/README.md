@@ -27,7 +27,7 @@ colcon build --packages-select agv2_pkg --cmake-args -DBUILD_TESTING=ON
 source install/setup.bash
 colcon test --packages-select agv2_pkg --ctest-args -R '^test_' --output-on-failure
 colcon test-result --verbose
-python3 -m unittest -v test/test_node_safety.py
+python3 -m unittest discover -v -s test -p test_node_safety.py
 ```
 
 The Python suite forces localhost-only ROS discovery, uses Domain 93 by default,
