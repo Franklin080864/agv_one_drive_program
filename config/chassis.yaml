@@ -61,14 +61,24 @@ agv2_control_node:
       input_timeout_ms: 1000    # single-source must be silent this long for another to take over
 
     diagnostics:
-      # Passive logging only. These thresholds set telemetry flags and never
-      # alter chassis commands or mode.
+      # Telemetry flags remain available; develop also uses feedback timeouts
+      # for safety gating after hardware has first become ready.
       wheel_feedback_timeout_ms: 500
       steer_feedback_timeout_ms: 300
       steer_loopback_window_ms: 50
       expect_tx_loopback: true
       min_motion_command_mps: 0.05
       steer_mismatch_deg: 8.0
+
+    # develop: existing motion parameters remain unchanged. These switches
+    # affect error handling; steering behavior changes stay opt-in.
+    safety:
+      feedback_stop_enabled: true
+      steer_alignment_enabled: false
+      steer_alignment_max_error_deg: 15.0
+      steer_error_stop_enabled: false
+      steer_error_stop_ms: 1000
+      hold_steering_on_teleop_stop: false
 
     joystick:
       # Button / axis indices for the new (post-2024) gamepad layout.

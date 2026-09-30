@@ -25,5 +25,6 @@ ctest \
   --label-regex gtest \
   --output-on-failure
 
-echo "Build and five functional gtests completed."
+python3 -m unittest discover -s "$repo_dir/test" -p test_prepare_chassis_shutdown.py
+echo "Build, seven functional gtest suites and shutdown-client tests completed."
 echo "Environment: source $repo_dir/deploy/setup_agv_env.bash"

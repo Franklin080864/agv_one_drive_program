@@ -60,6 +60,16 @@ agv2_control_node:
       min_motion_command_mps: 0.05
       steer_mismatch_deg: 8.0
 
+    # develop: existing motion parameters remain unchanged. These switches
+    # affect error handling; steering behavior changes stay opt-in.
+    safety:
+      feedback_stop_enabled: true
+      steer_alignment_enabled: false
+      steer_alignment_max_error_deg: 15.0
+      steer_error_stop_enabled: false
+      steer_error_stop_ms: 1000
+      hold_steering_on_teleop_stop: false
+
     joystick:
       enable_button: 8
       ad_enable_button: 9

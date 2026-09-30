@@ -1,0 +1,60 @@
+name: Driver regression tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  humble:
+    runs-on: ubuntu-22.04
+    container: ros:humble-ros-base-jammy
+    timeout-minutes: 20
+    env:
+      ROS_DISTRO: humble
+      ROS_LOCALHOST_ONLY: "1"
+      AGV_TEST_DOMAIN_ID: "93"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and message dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y \
+            build-essential python3-colcon-common-extensions \
+            ros-humble-ament-cmake-gtest ros-humble-ament-lint-auto \
+            ros-humble-ament-lint-common ros-humble-can-msgs \
+            ros-humble-diagnostic-msgs ros-humble-geometry-msgs \
+            ros-humble-sensor-msgs ros-humble-std-msgs ros-humble-std-srvs
+      - name: Build package and regression tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build --packages-select agv2_pkg --event-handlers console_direct+ \
+            --cmake-args -DBUILD_TESTING=ON
+      - name: Core regression tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          # Existing formatting lint is intentionally separate from the safety
+          # regression gate. This includes every core executable named test_*.
+          colcon test --packages-select agv2_pkg --event-handlers console_direct+ \
+            --ctest-args -R '^test_' --output-on-failure
+          colcon test-result --verbose
+      - name: Shutdown client contract tests
+        run: python3 -m unittest -v test/test_prepare_chassis_shutdown.py
+      - name: ROS node fault-injection tests (simulated CAN only)
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          python3 -m unittest -v test/test_node_safety.py
+      - name: Retain test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: humble-regression-logs
+          path: |
+            log/
+            build/agv2_pkg/test_results/

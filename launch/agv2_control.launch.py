@@ -28,6 +28,7 @@ def launch_fault_logging(context):
         '/to_can_bus',
         '/from_can_bus',
         '/agv2/chassis_telemetry',
+        '/agv2/diagnostics',
         '/agv2/log_event',
         '/rosout',
         '/parameter_events',

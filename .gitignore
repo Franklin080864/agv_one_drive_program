@@ -7,3 +7,7 @@ log_*/
 data/chassis_faults/
 *.db3
 *.mcap
+
+# Python test/import artifacts
+__pycache__/
+*.py[cod]

@@ -44,6 +44,7 @@ can_msgs::msg::Frame encode_steer_position_query(uint32_t can_id);
 // Steering motor: 0xa4 multi-turn position command. angle_rad is converted to
 // 0.01-degree units internally; speed_field is the on-wire speed limit
 // (typically kSteerSpeedDps).
+// Non-finite angles produce a position query instead of a motion command.
 can_msgs::msg::Frame encode_steer_position_cmd(uint32_t can_id,
                                                double angle_rad,
                                                uint16_t speed_field = kSteerSpeedDps);
@@ -55,6 +56,7 @@ double normalize_single_turn_angle_deg(double angle_deg);
 // Wheel motor (CANopen RPDO): set Target Velocity (0x60FFh, sub 0x03).
 // speed_mps is body-frame; sign correction (direction) is applied here.
 // Output value is int32 in 0.1 RPM units (CANopen standard).
+// Invalid speed/limits/direction produce a zero-velocity target.
 can_msgs::msg::Frame encode_wheel_velocity(uint32_t can_id,
                                            double speed_mps,
                                            int direction,

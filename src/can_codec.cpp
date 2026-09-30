@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 namespace agv2_pkg {
 
@@ -15,6 +16,7 @@ can_msgs::msg::Frame make_frame(uint32_t id) {
   f.dlc = 8;
   f.is_rtr = false;
   f.is_extended = false;
+  f.is_error = false;
   f.data = {0, 0, 0, 0, 0, 0, 0, 0};
   return f;
 }
@@ -29,6 +31,21 @@ void write_int32_le(can_msgs::msg::Frame& f, size_t offset, int32_t v) {
 double mps_to_rpm(double mps, double wheel_radius) {
   // v = omega * r => omega = v / r [rad/s]; rpm = omega * 60 / (2*pi).
   return (mps / wheel_radius) * 60.0 / (2.0 * kPi);
+}
+
+bool valid_standard_data_frame(const can_msgs::msg::Frame& frame,
+                               uint8_t minimum_dlc) {
+  return !frame.is_error && !frame.is_extended && !frame.is_rtr &&
+         frame.id <= 0x7ff && frame.dlc >= minimum_dlc && frame.dlc <= 8;
+}
+
+int32_t rounded_int32(double value) {
+  // Saturate before lround/conversion, whose out-of-range results are not
+  // suitable for an actuator target. Existing in-range rounding is unchanged.
+  value = std::clamp(value,
+                     static_cast<double>(std::numeric_limits<int32_t>::min()),
+                     static_cast<double>(std::numeric_limits<int32_t>::max()));
+  return static_cast<int32_t>(std::lround(value));
 }
 }  // namespace
 
@@ -47,13 +64,16 @@ can_msgs::msg::Frame encode_steer_position_query(uint32_t can_id) {
 can_msgs::msg::Frame encode_steer_position_cmd(uint32_t can_id,
                                                double angle_rad,
                                                uint16_t speed_field) {
+  // Invalid angles must not become an arbitrary actuator position or force a
+  // recenter. The node rejects such input; this is a final codec safeguard.
+  if (!std::isfinite(angle_rad)) return encode_steer_position_query(can_id);
   auto f = make_frame(can_id);
   f.data[0] = 0xa4;
   f.data[1] = 0x00;
   f.data[2] = static_cast<uint8_t>(speed_field & 0xFF);
   f.data[3] = static_cast<uint8_t>((speed_field >> 8) & 0xFF);
   const double angle_deg = angle_rad * 180.0 / kPi;
-  const int32_t angle_centideg = static_cast<int32_t>(std::lround(angle_deg * 100.0));
+  const int32_t angle_centideg = rounded_int32(angle_deg * 100.0);
   write_int32_le(f, 4, angle_centideg);
   return f;
 }
@@ -66,10 +86,16 @@ can_msgs::msg::Frame encode_wheel_velocity(uint32_t can_id,
                                            double speed_mps,
                                            int direction,
                                            const WheelLimits& lim) {
-  const double signed_mps = speed_mps * static_cast<double>(direction);
-  double rpm = mps_to_rpm(signed_mps, lim.wheel_radius);
-  rpm = std::clamp(rpm, -lim.max_rpm, lim.max_rpm);
-  const int32_t target = static_cast<int32_t>(std::lround(rpm * 10.0));  // 0.1 RPM units
+  double rpm = 0.0;
+  if (std::isfinite(speed_mps) &&
+      std::isfinite(lim.wheel_radius) && lim.wheel_radius > 0.0 &&
+      std::isfinite(lim.max_rpm) && lim.max_rpm >= 0.0 &&
+      (direction == -1 || direction == 1)) {
+    const double signed_mps = speed_mps * static_cast<double>(direction);
+    rpm = mps_to_rpm(signed_mps, lim.wheel_radius);
+    rpm = std::clamp(rpm, -lim.max_rpm, lim.max_rpm);
+  }
+  const int32_t target = rounded_int32(rpm * 10.0);  // 0.1 RPM units
 
   auto f = make_frame(can_id);
   f.data[0] = 0x0f;
@@ -135,7 +161,7 @@ WheelStatus decode_wheel_status(const can_msgs::msg::Frame& f,
                                 uint32_t rear_status_id) {
   WheelStatus s{};
   if (f.id != front_status_id && f.id != rear_status_id) return s;
-  if (f.is_rtr || f.dlc < 8) return s;
+  if (!valid_standard_data_frame(f, 8)) return s;
   s.status_word =
       static_cast<uint16_t>(f.data[0]) |
       (static_cast<uint16_t>(f.data[1]) << 8);
@@ -162,7 +188,7 @@ SteerPosition decode_steer_position(const can_msgs::msg::Frame& f,
                                     uint32_t front_fb_id) {
   SteerPosition out{};
   if (f.id != rear_fb_id && f.id != front_fb_id) return out;
-  if (f.is_rtr || f.dlc < 8) return out;
+  if (!valid_standard_data_frame(f, 8)) return out;
   if (f.data[0] != 0x94) return out;
   const uint32_t raw =
       (static_cast<uint32_t>(f.data[7]) << 24) |
@@ -179,7 +205,7 @@ SteerPosition decode_steer_position(const can_msgs::msg::Frame& f,
 BatterySoc decode_battery_soc(const can_msgs::msg::Frame& f) {
   BatterySoc out{};
   if (f.id != kBatterySocId) return out;
-  if (f.is_rtr || f.dlc < 7) return out;
+  if (!valid_standard_data_frame(f, 7)) return out;
   out.soc = static_cast<double>(f.data[6]);
   out.present = true;
   return out;

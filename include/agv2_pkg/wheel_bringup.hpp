@@ -8,8 +8,8 @@ namespace agv2_pkg {
 
 struct WheelBringupConfig {
   bool wait_for_can_sender;
-  int64_t sdo_retry_period_ms;
-  int64_t status_stale_ms;
+  int64_t sdo_retry_period_ms;  // <= 0: first attempt only; never retry each tick
+  int64_t status_stale_ms;      // <= 0: timeout disabled (legacy configuration)
   int64_t warn_period_ms;
 };
 
@@ -27,6 +27,8 @@ enum class WheelBringupPhase {
   SwitchOn,
   EnableOperation,
   Enabled,
+  StaleFeedback,
+  Fault,
 };
 
 struct WheelBringupDecision {
@@ -39,7 +41,12 @@ struct WheelBringupDecision {
   bool status_stale{false};
 };
 
+// Call only after decoding a valid wheel status frame (status.present).
 void note_wheel_status(WheelBringupState& state, int64_t now_ms);
+
+// Reset host-side tracking for an explicit reconnect/reinitialization. This does
+// not reset a motor fault or authorize motion; the caller owns those policies.
+void reset_wheel_bringup(WheelBringupState& state);
 
 bool is_wheel_status_stale(const WheelBringupState& state,
                            const WheelBringupConfig& cfg,

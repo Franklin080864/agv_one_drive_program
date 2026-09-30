@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include "agv2_pkg/can_codec.hpp"
 
@@ -230,4 +231,90 @@ TEST(CanCodec, TerminatorPayload) {
   EXPECT_EQ(f.id, 0x001u);
   for (size_t i = 0; i < 7; ++i) EXPECT_EQ(f.data[i], 0xFF);
   EXPECT_EQ(f.data[7], 0xFD);
+}
+
+TEST(CanCodec, RejectsInvalidCanFlagsAndDlcForAllFeedbackTypes) {
+  for (int kind = 0; kind < 5; ++kind) {
+    can_msgs::msg::Frame f;
+    f.dlc = 8;
+    f.data.fill(0);
+    f.data[0] = 0x94;
+    switch (kind) {
+      case 0: f.is_error = true; break;
+      case 1: f.is_extended = true; break;
+      case 2: f.is_rtr = true; break;
+      case 3: f.dlc = 9; break;
+      case 4: f.dlc = 6; break;
+    }
+    f.id = kWheelFrontStatusId;
+    EXPECT_FALSE(decode_wheel_status(f).present);
+    f.id = kSteerFrontFbId;
+    EXPECT_FALSE(decode_steer_position(f).present);
+    f.id = kBatterySocId;
+    EXPECT_FALSE(decode_battery_soc(f).present);
+  }
+}
+
+TEST(CanCodec, RejectsOutOfRangeStandardIdEvenWithCustomConfiguration) {
+  can_msgs::msg::Frame f;
+  f.id = 0x800;
+  f.dlc = 8;
+  f.data.fill(0);
+  f.data[0] = 0x94;
+  EXPECT_FALSE(decode_wheel_status(f, 0x800, 0x801).present);
+  EXPECT_FALSE(decode_steer_position(f, 0x800, 0x801).present);
+}
+
+TEST(CanCodec, BatterySocAcceptsSevenOrEightByteDataFrame) {
+  can_msgs::msg::Frame f;
+  f.id = kBatterySocId;
+  f.data.fill(0);
+  f.data[6] = 73;
+  for (const uint8_t dlc : {uint8_t{7}, uint8_t{8}}) {
+    f.dlc = dlc;
+    const auto soc = decode_battery_soc(f);
+    EXPECT_TRUE(soc.present);
+    EXPECT_EQ(soc.soc, 73.0);
+  }
+}
+
+TEST(CanCodec, NonFiniteMotionInputDoesNotReachIntegerConversion) {
+  const WheelLimits lim{200.0, 0.10};
+  for (const double invalid : {std::numeric_limits<double>::quiet_NaN(),
+                               std::numeric_limits<double>::infinity(),
+                               -std::numeric_limits<double>::infinity()}) {
+    const auto wheel = encode_wheel_velocity(kWheelFrontId, invalid, 1, lim);
+    EXPECT_EQ(wheel.data[0], 0x0f);
+    EXPECT_EQ(read_int32_le(wheel, 3), 0);
+    const auto steer = encode_steer_position_cmd(kSteerFrontId, invalid);
+    EXPECT_EQ(steer.data[0], 0x94);
+  }
+}
+
+TEST(CanCodec, InvalidWheelLimitsOrDirectionProduceZeroTarget) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  for (const WheelLimits lim : {WheelLimits{200.0, 0.0}, WheelLimits{200.0, -0.1},
+                               WheelLimits{-1.0, 0.1}, WheelLimits{nan, 0.1},
+                               WheelLimits{200.0, nan}, WheelLimits{inf, 0.1},
+                               WheelLimits{200.0, inf}}) {
+    EXPECT_EQ(read_int32_le(encode_wheel_velocity(kWheelFrontId, 0.5, 1, lim), 3), 0);
+  }
+  for (const int direction : {0, 2, -2}) {
+    EXPECT_EQ(read_int32_le(encode_wheel_velocity(kWheelFrontId, 0.5, direction,
+                                                 WheelLimits{200.0, 0.1}), 3), 0);
+  }
+}
+
+TEST(CanCodec, ExtremeFiniteTargetsSaturateWithoutIntegerOverflow) {
+  const double huge = std::numeric_limits<double>::max();
+  const auto positive_steer = encode_steer_position_cmd(kSteerFrontId, huge);
+  const auto negative_steer = encode_steer_position_cmd(kSteerFrontId, -huge);
+  EXPECT_EQ(read_int32_le(positive_steer, 4), std::numeric_limits<int32_t>::max());
+  EXPECT_EQ(read_int32_le(negative_steer, 4), std::numeric_limits<int32_t>::min());
+  const WheelLimits lim{huge, 0.1};
+  EXPECT_EQ(read_int32_le(encode_wheel_velocity(kWheelFrontId, huge, 1, lim), 3),
+            std::numeric_limits<int32_t>::max());
+  EXPECT_EQ(read_int32_le(encode_wheel_velocity(kWheelFrontId, -huge, 1, lim), 3),
+            std::numeric_limits<int32_t>::min());
 }

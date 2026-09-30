@@ -5,6 +5,9 @@
 
 #include <can_msgs/msg/frame.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <diagnostic_msgs/msg/key_value.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -16,6 +19,10 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <stdexcept>
+#include <sstream>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -23,6 +30,7 @@
 
 #include "agv2_pkg/can_codec.hpp"
 #include "agv2_pkg/fsm.hpp"
+#include "agv2_pkg/control_safety.hpp"
 #include "agv2_pkg/kinematics.hpp"
 #include "agv2_pkg/rate_limiter.hpp"
 #include "agv2_pkg/teleop.hpp"
@@ -44,7 +52,7 @@ void shutdown_signal_handler(int /*sig*/) {
 }
 
 enum class Mode { Idle, Teleop, Auto };
-enum class ActiveSource { None, CmdVel, WheelCmd };
+using ActiveSource = CommandSource;
 
 struct SteerDirections {
   int front;  // expected -1 or +1
@@ -69,7 +77,7 @@ class Agv2Control : public rclcpp::Node {
   Agv2Control() : Node("agv2_control_node") {
     declare_and_load_params();
 
-    rclcpp::QoS cmd_qos(rclcpp::KeepLast(10));
+    rclcpp::QoS cmd_qos(rclcpp::KeepLast(1));
     cmd_vel_sub_ = create_subscription<geometry_msgs::msg::Twist>(
         "cmd_vel", cmd_qos,
         std::bind(&Agv2Control::on_cmd_vel, this, std::placeholders::_1));
@@ -77,7 +85,7 @@ class Agv2Control : public rclcpp::Node {
         "wheel_command", cmd_qos,
         std::bind(&Agv2Control::on_wheel_command, this, std::placeholders::_1));
     joy_sub_ = create_subscription<sensor_msgs::msg::Joy>(
-        "joy", rclcpp::QoS(10),
+        "joy", rclcpp::QoS(1),
         std::bind(&Agv2Control::on_joy, this, std::placeholders::_1));
     can_sub_ = create_subscription<can_msgs::msg::Frame>(
         "from_can_bus", rclcpp::QoS(1000),
@@ -87,6 +95,42 @@ class Agv2Control : public rclcpp::Node {
     soc_pub_ = create_publisher<std_msgs::msg::Float64>("Battery_SOC_STATE", rclcpp::QoS(10));
     telemetry_pub_ = create_publisher<msg::ChassisTelemetry>(
         "agv2/chassis_telemetry", rclcpp::QoS(100));
+    diagnostics_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+        "agv2/diagnostics", rclcpp::QoS(10));
+    reset_faults_srv_ = create_service<std_srvs::srv::Trigger>(
+        "agv2/reset_faults",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+          reset_faults(*res);
+        });
+    reinitialize_srv_ = create_service<std_srvs::srv::Trigger>(
+        "agv2/reinitialize_transport",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+          if (mode_ != Mode::Idle || shutdown_prepared_ || g_shutdown_requested.load() ||
+              !actuation_ever_started_ || !can_sender_ready_for_bringup()) {
+            res->success = false;
+            res->message = "requires an already-started, locked chassis and a connected CAN sender";
+            return;
+          }
+          if (wheel_front_status_.fault || wheel_rear_status_.fault ||
+              wheel_front_status_.error_code != 0 || wheel_rear_status_.error_code != 0) {
+            res->success = false;
+            res->message = "resolve drive faults first; automatic drive fault-reset is prohibited";
+            return;
+          }
+          stop_motion("transport_reinitializing");
+          startup_interlock_released_ = true;  // Recovery remains fault-latched.
+          reset_wheel_bringup(wheel_front_bringup_);
+          reset_wheel_bringup(wheel_rear_bringup_);
+          recovery_requested_ = true;
+          recovery_started_ms_ = now_steady_ms();
+          recovery_status_ = "waiting_feedback";
+          fault_latch_.update(fault_latch_.active() | TransportRecovery);
+          res->success = true;
+          res->message = "communication recovery scheduled with shutdown controlwords only; verify diagnostics, reset faults, then re-enable";
+          publish_diagnostics(true);
+        });
 
     lock_srv_ = create_service<std_srvs::srv::Trigger>(
         "agv2/lock",
@@ -94,8 +138,7 @@ class Agv2Control : public rclcpp::Node {
                std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
           {
             std::lock_guard<std::mutex> lk(mu_);
-            fsm_->on_lock_request();
-            mode_ = Mode::Idle;
+            stop_motion("operator_lock");
           }
           res->success = true;
           res->message = "locked";
@@ -106,13 +149,15 @@ class Agv2Control : public rclcpp::Node {
                std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
           {
             std::lock_guard<std::mutex> lk(mu_);
-            fsm_->on_lock_request();
-            mode_ = Mode::Idle;
-            state_.v_front = 0.0;
-            state_.v_rear = 0.0;
+            stop_motion("shutdown_requested");
           }
 
-          if (!steering_brought_up_) {
+          if (shutdown_prepared_) {
+            res->success = true;
+            res->message = "shutdown already prepared (DDS delivery only)";
+            return;
+          }
+          if (!actuation_ever_started_) {
             shutdown_prepared_ = true;
             res->success = true;
             res->message = "actuation was never brought up; no final CAN frame required";
@@ -124,10 +169,7 @@ class Agv2Control : public rclcpp::Node {
             return;
           }
 
-          can_pub_->publish(encode_wheel_velocity(
-              can_ids_.wheel_front, 0.0, dirs_.front, wheel_lim_));
-          can_pub_->publish(encode_wheel_velocity(
-              can_ids_.wheel_rear, 0.0, dirs_.rear, wheel_lim_));
+          publish_zero_wheels();
           const auto terminator = encode_terminator();
           RCLCPP_INFO(get_logger(),
                       "Preparing terminator id=0x%03x dlc=%u tail=0x%02x.",
@@ -135,13 +177,13 @@ class Agv2Control : public rclcpp::Node {
                       static_cast<unsigned int>(terminator.dlc),
                       static_cast<unsigned int>(terminator.data[7]));
           can_pub_->publish(terminator);
-          const bool acknowledged =
-              can_pub_->wait_for_all_acked(std::chrono::milliseconds(500));
-          shutdown_prepared_ = true;
-          res->success = true;
+          const bool acknowledged = wait_for_can_delivery();
+          shutdown_prepared_ = acknowledged;
+          res->success = acknowledged;
           res->message = acknowledged
-              ? "zero wheel frames and terminator acknowledged by CAN sender"
-              : "final frames queued; DDS acknowledgment timed out, verify CAN capture";
+              ? "final frames acknowledged at DDS layer; physical stop still requires verification"
+              : "DDS delivery was not confirmed; control remains locked, keep CAN running";
+          publish_diagnostics(true);
         });
 
     const auto period = std::chrono::milliseconds(
@@ -172,14 +214,15 @@ class Agv2Control : public rclcpp::Node {
                   "Graceful shutdown was already prepared; suppressing duplicate frame.");
       return;
     }
-    if (!steering_brought_up_) {
+    if (!actuation_ever_started_) {
       RCLCPP_INFO(get_logger(),
                   "Actuation was never brought up; suppressing terminator CAN frame.");
       return;
     }
+    stop_motion("process_shutdown");
+    publish_zero_wheels();
     can_pub_->publish(encode_terminator());
-    const bool acknowledged =
-        can_pub_->wait_for_all_acked(std::chrono::milliseconds(500));
+    const bool acknowledged = wait_for_can_delivery();
     if (acknowledged) {
       RCLCPP_INFO(get_logger(), "Terminator CAN frame acknowledged by ROS subscribers.");
     } else {
@@ -245,6 +288,9 @@ class Agv2Control : public rclcpp::Node {
         stop_eps});
 
     input_timeout_ms_ = declare_parameter<int>("arbitrator.input_timeout_ms", 1000);
+    arbitrator_ = std::make_unique<CommandArbitrator>(
+        std::chrono::milliseconds(watchdog_ms),
+        std::chrono::milliseconds(input_timeout_ms_));
 
     diagnostic_cfg_.wheel_feedback_timeout_ms =
         declare_ms_parameter("diagnostics.wheel_feedback_timeout_ms", 500);
@@ -280,27 +326,83 @@ class Agv2Control : public rclcpp::Node {
         "joystick.teleop_rotate_omega", legacy_rotate_speed / rotate_radius);
     joy_.teleop_steer_lock    = declare_parameter<double>("joystick.teleop_steer_lock", 1.5708);
     joy_.teleop_deadband      = declare_parameter<double>("joystick.teleop_deadband", 0.1);
+
+    safety_.feedback_stop_enabled = declare_parameter<bool>("safety.feedback_stop_enabled", true);
+    safety_.steer_alignment_enabled = declare_parameter<bool>("safety.steer_alignment_enabled", false);
+    safety_.steer_alignment_max_error_deg = declare_parameter<double>(
+        "safety.steer_alignment_max_error_deg", 15.0);
+    safety_.steer_error_stop_enabled = declare_parameter<bool>("safety.steer_error_stop_enabled", false);
+    safety_.steer_error_stop_ms = declare_ms_parameter("safety.steer_error_stop_ms", 1000);
+    safety_.hold_steering_on_teleop_stop = declare_parameter<bool>(
+        "safety.hold_steering_on_teleop_stop", false);
+    diagnostic_period_ms_ = declare_ms_parameter("diagnostics.publish_period_ms", 200);
+    hardware_id_ = declare_parameter<std::string>("diagnostics.hardware_id", "agv");
+
+    const auto require = [](bool valid, const char* message) {
+      if (!valid) throw std::invalid_argument(message);
+    };
+    require(all_finite({geom_.front_x, geom_.front_y, geom_.rear_x, geom_.rear_y}) &&
+            std::hypot(geom_.front_x - geom_.rear_x, geom_.front_y - geom_.rear_y) > 1e-6,
+            "chassis wheel positions must be finite and distinct");
+    require(finite_positive(wheel_lim_.wheel_radius), "chassis.wheel_radius must be positive");
+    require((dirs_.front == 1 || dirs_.front == -1) && (dirs_.rear == 1 || dirs_.rear == -1) &&
+            (steer_dirs_.front == 1 || steer_dirs_.front == -1) &&
+            (steer_dirs_.rear == 1 || steer_dirs_.rear == -1), "motor/steer directions must be +/-1");
+    require(finite_positive(max_linear_speed_) && finite_positive(max_angular_speed_) &&
+            finite_positive(wheel_lim_.max_rpm) && finite_positive(singularity_speed_) &&
+            finite_in_range(max_steer_angle_, 0.001, 1.5708), "invalid motion limits");
+    require(finite_in_range(loop_hz_, 1.0, 200.0) && finite_positive(rate_lim_.max_d_speed),
+            "loop_hz must be 1..200 and speed step must be positive");
+    require(settle_ms >= 0 && finite_nonnegative(stop_eps), "invalid FSM stop/settle parameters");
+    require(bringup_cfg_.status_stale_ms > 0 && bringup_cfg_.sdo_retry_period_ms > 0 &&
+            diagnostic_cfg_.wheel_feedback_timeout_ms > 0 &&
+            diagnostic_cfg_.steer_feedback_timeout_ms > 0 && diagnostic_period_ms_ > 0,
+            "feedback, SDO retry and diagnostic periods must be positive");
+    require(finite_positive(diagnostic_cfg_.steer_mismatch_deg) &&
+            finite_nonnegative(diagnostic_cfg_.min_motion_command_mps) &&
+            finite_in_range(safety_.steer_alignment_max_error_deg, 0.1, 180.0) &&
+            safety_.steer_error_stop_ms > 0, "invalid steering safety thresholds");
+    require(finite_nonnegative(joy_.heartbeat_timeout_s) && finite_positive(joy_.teleop_max_speed) &&
+            finite_positive(joy_.teleop_rotate_omega) && finite_in_range(joy_.teleop_deadband, 0.0, 1.0) &&
+            finite_in_range(joy_.teleop_steer_lock, 0.0, max_steer_angle_) &&
+            all_finite({joy_.left_linear_sign, joy_.left_angular_sign}), "invalid joystick parameters");
+    const std::set<uint32_t> ids{can_ids_.steer_front, can_ids_.steer_rear,
+        can_ids_.wheel_front, can_ids_.wheel_rear, can_ids_.wheel_front_status,
+        can_ids_.wheel_rear_status, can_ids_.sdo_front, can_ids_.sdo_rear};
+    require(ids.size() == 8, "configured motor CAN IDs must be distinct");
+    require(can_ids_.front_node_id != can_ids_.rear_node_id, "CANopen node IDs must be distinct");
   }
 
   // -------- callbacks --------
   void on_cmd_vel(const geometry_msgs::msg::Twist::SharedPtr msg) {
     std::lock_guard<std::mutex> lk(mu_);
+    if (!all_finite({msg->linear.x, msg->linear.y, msg->angular.z})) {
+      reject_input(2, "cmd_vel contains non-finite values", mode_ == Mode::Auto);
+      return;
+    }
+    invalid_sources_ &= ~2u;
     cmd_vx_    = std::clamp(msg->linear.x,  -max_linear_speed_, max_linear_speed_);
     cmd_vy_    = std::clamp(msg->linear.y,  -max_linear_speed_, max_linear_speed_);
     cmd_omega_ = std::clamp(msg->angular.z, -max_angular_speed_, max_angular_speed_);
     last_cmd_vel_t_ = now_steady();
-    if (mode_ == Mode::Auto) fsm_->on_active_input(last_cmd_vel_t_);
+    if (mode_ == Mode::Auto) arbitrator_->note_input(CommandSource::CmdVel, last_cmd_vel_t_);
   }
 
   void on_wheel_command(const msg::WheelCommand::SharedPtr msg) {
     std::lock_guard<std::mutex> lk(mu_);
+    if (!all_finite({msg->front_steer_angle, msg->rear_steer_angle,
+                     msg->front_wheel_speed, msg->rear_wheel_speed})) {
+      reject_input(4, "wheel_command contains non-finite values", mode_ == Mode::Auto);
+      return;
+    }
+    invalid_sources_ &= ~4u;
     wheel_cmd_target_.theta_front = std::clamp(msg->front_steer_angle, -max_steer_angle_, max_steer_angle_);
     wheel_cmd_target_.theta_rear  = std::clamp(msg->rear_steer_angle,  -max_steer_angle_, max_steer_angle_);
     wheel_cmd_target_.v_front = std::clamp(msg->front_wheel_speed, -max_linear_speed_, max_linear_speed_);
     wheel_cmd_target_.v_rear  = std::clamp(msg->rear_wheel_speed,  -max_linear_speed_, max_linear_speed_);
     wheel_cmd_target_.singular = false;
     last_wheel_cmd_t_ = now_steady();
-    if (mode_ == Mode::Auto) fsm_->on_active_input(last_wheel_cmd_t_);
+    if (mode_ == Mode::Auto) arbitrator_->note_input(CommandSource::WheelCmd, last_wheel_cmd_t_);
   }
 
   void on_joy(const sensor_msgs::msg::Joy::SharedPtr j) {
@@ -318,38 +420,31 @@ class Agv2Control : public rclcpp::Node {
     const bool enable_now    = btn(joy_.enable_button);
     const bool ad_now        = btn(joy_.ad_enable_button);
 
-    // Establish a released/pressed baseline first. A button already held while
-    // the node starts must not release the startup actuation interlock.
-    if (!joy_edges_initialized_) {
-      joy_prev_.emergency = emergency_now;
-      joy_prev_.enable = enable_now;
-      joy_prev_.ad = ad_now;
-      joy_edges_initialized_ = true;
-      RCLCPP_INFO(get_logger(), "Joy edge baseline established; actuation remains interlocked.");
-    } else if (emergency_now && !joy_prev_.emergency) {
-      mode_ = Mode::Idle;
-      fsm_->on_lock_request();
-      RCLCPP_WARN(get_logger(), "Joy: emergency pressed -> Idle/Locked.");
-    } else if (enable_now && !joy_prev_.enable) {
-      bool axes_neutral = true;
-      for (int i = 0; i <= 3 && i < static_cast<int>(j->axes.size()); ++i) {
-        if (std::fabs(j->axes[i]) > 1e-3) { axes_neutral = false; break; }
-      }
-      if (axes_neutral) {
-        mode_ = Mode::Teleop;
-        release_startup_interlock("Teleop");
-        RCLCPP_INFO(get_logger(), "Joy: enable pressed -> Teleop.");
-      } else {
-        RCLCPP_WARN(get_logger(), "Joy: enable rejected; axes 0-3 not neutral.");
-      }
-    } else if (ad_now && !joy_prev_.ad) {
-      mode_ = Mode::Auto;
-      release_startup_interlock("Auto");
-      RCLCPP_INFO(get_logger(), "Joy: AD pressed -> Auto.");
+    bool axes_neutral = true;
+    for (int i = 0; i <= 3 && i < static_cast<int>(j->axes.size()); ++i) {
+      if (!std::isfinite(j->axes[i]) || std::fabs(j->axes[i]) > 1e-3) axes_neutral = false;
     }
-    joy_prev_.emergency = emergency_now;
-    joy_prev_.enable    = enable_now;
-    joy_prev_.ad        = ad_now;
+    const auto action = joy_gate_.update(emergency_now, enable_now, ad_now, axes_neutral);
+    if (action == JoyEnableAction::Emergency) {
+      stop_motion("software_emergency");
+    }
+    if (!std::all_of(j->axes.begin(), j->axes.end(),
+                     [](float value) { return std::isfinite(value); })) {
+      reject_input(1, "joy contains non-finite axes", mode_ != Mode::Idle);
+      return;
+    }
+    invalid_sources_ &= ~1u;
+    if (action == JoyEnableAction::TeleopRejected) {
+      RCLCPP_WARN(get_logger(), "Joy: enable rejected; axes 0-3 not neutral.");
+    } else if (action == JoyEnableAction::TeleopEnable || action == JoyEnableAction::AutoEnable) {
+      if (fault_latch_.latched() != 0 || shutdown_prepared_ || invalid_sources_ != 0) {
+        RCLCPP_WARN(get_logger(), "Enable rejected: clear faults/invalid input before rearming.");
+      } else {
+        stop_motion("enabled_waiting_input");
+        mode_ = action == JoyEnableAction::TeleopEnable ? Mode::Teleop : Mode::Auto;
+        release_startup_interlock(mode_ == Mode::Teleop ? "Teleop" : "Auto");
+      }
+    }
 
     // Compute teleop target (only used while mode_ == Teleop).
     const double sa = axis(joy_.speed_axis);
@@ -364,6 +459,11 @@ class Agv2Control : public rclcpp::Node {
         TeleopParams{joy_.teleop_max_speed, joy_.teleop_rotate_omega,
                      joy_.teleop_steer_lock, joy_.teleop_deadband},
         geom_, singularity_speed_, state_.theta_front, state_.theta_rear);
+    if (safety_.hold_steering_on_teleop_stop &&
+        joy_target_.v_front == 0.0 && joy_target_.v_rear == 0.0) {
+      joy_target_.theta_front = state_.theta_front;
+      joy_target_.theta_rear = state_.theta_rear;
+    }
     if (mode_ == Mode::Teleop) fsm_->on_active_input(last_joy_t_);
   }
 
@@ -371,7 +471,9 @@ class Agv2Control : public rclcpp::Node {
     const int64_t now_ms = now_steady_ms();
     if (f->is_error) {
       ++can_error_frame_count_;
+      return;
     }
+    if (f->is_extended || f->is_rtr || f->dlc > 8) return;
     auto status = decode_wheel_status(
         *f, can_ids_.wheel_front_status, can_ids_.wheel_rear_status);
     if (status.present) {
@@ -416,7 +518,10 @@ class Agv2Control : public rclcpp::Node {
 
   // -------- main loop --------
   void tick() {
-    if (shutdown_prepared_) return;
+    if (shutdown_prepared_) {
+      publish_diagnostics();
+      return;
+    }
 
     // Publish the final frame from a normal executor callback while the ROS
     // context and matched CAN sender subscription are still fully active.
@@ -439,12 +544,12 @@ class Agv2Control : public rclcpp::Node {
             age > joy_.heartbeat_timeout_s) {
           RCLCPP_ERROR(get_logger(),
               "Joy heartbeat lost (%.2fs) — dropping to Idle/Locked.", age);
-          mode_ = Mode::Idle;
-          fsm_->on_lock_request();
+          stop_motion("joy_heartbeat_timeout");
         }
       }
     }
 
+    update_fault_state();
     WheelTargets target{};
     bool have_input = false;
     Mode mode_now;
@@ -472,12 +577,25 @@ class Agv2Control : public rclcpp::Node {
       target.v_rear  = 0.0;
     }
 
-    // Apply command shaping: steering angle passes through, wheel speed slews.
+    // The optional steering gate is off in the compatibility profile.
+    const bool align_wait = safety_.steer_alignment_enabled && have_input &&
+        (std::fabs(steer_error_deg(target.theta_front, steer_front_fb_deg_)) >
+             safety_.steer_alignment_max_error_deg ||
+         std::fabs(steer_error_deg(target.theta_rear, steer_rear_fb_deg_)) >
+             safety_.steer_alignment_max_error_deg);
+    if (align_wait) {
+      target.v_front = target.v_rear = 0.0;
+      state_.v_front = state_.v_rear = 0.0;
+      stop_reason_ = "steering_alignment";
+    } else if (mode_now != Mode::Idle) {
+      stop_reason_ = have_input && st == FsmState::Normal ? "running" : "command_timeout";
+    }
     state_ = step(state_, target, rate_lim_);
 
     // Emit per-tick CAN traffic.
     emit_can_frames(st == FsmState::Locked, startup_interlock_released_);
     publish_telemetry(requested_target, have_input, mode_now, st);
+    publish_diagnostics();
   }
 
   // Pick the highest-priority active input. Returns true if a target was set.
@@ -498,34 +616,18 @@ class Agv2Control : public rclcpp::Node {
       return false;
     }
     if (mode_ == Mode::Auto) {
-      const bool wc_fresh = fresh(last_wheel_cmd_t_);
-      const bool cv_fresh = fresh(last_cmd_vel_t_);
-
-      // Session model: the source that starts a session holds priority until
-      // it goes silent for >input_timeout_ms; only then can the other take over.
-      if (active_source_ == ActiveSource::WheelCmd && !wc_fresh) {
-        active_source_ = ActiveSource::None;
-      } else if (active_source_ == ActiveSource::CmdVel && !cv_fresh) {
-        active_source_ = ActiveSource::None;
-      }
-      if (active_source_ == ActiveSource::None) {
-        if (wc_fresh && cv_fresh) {
-          active_source_ = (last_wheel_cmd_t_ <= last_cmd_vel_t_)
-              ? ActiveSource::WheelCmd : ActiveSource::CmdVel;
-        } else if (wc_fresh) {
-          active_source_ = ActiveSource::WheelCmd;
-        } else if (cv_fresh) {
-          active_source_ = ActiveSource::CmdVel;
-        }
-      }
-
-      if (active_source_ == ActiveSource::WheelCmd && wc_fresh) {
+      const auto selected = arbitrator_->select(now);
+      active_source_ = selected.source;
+      if (!selected.fresh_for_motion) return false;
+      // Only the owner refreshes motion safety, using its receive time rather
+      // than the timer time. Other publishers cannot keep an old command alive.
+      fsm_->on_active_input(selected.last_input);
+      if (selected.source == CommandSource::WheelCmd) {
         out = wheel_cmd_target_;
         return true;
       }
-      if (active_source_ == ActiveSource::CmdVel && cv_fresh) {
-        out = solve_ik(cmd_vx_, cmd_vy_, cmd_omega_, geom_,
-                       singularity_speed_,
+      if (selected.source == CommandSource::CmdVel) {
+        out = solve_ik(cmd_vx_, cmd_vy_, cmd_omega_, geom_, singularity_speed_,
                        state_.theta_front, state_.theta_rear);
         return true;
       }
@@ -547,9 +649,20 @@ class Agv2Control : public rclcpp::Node {
     // Startup is passive: do not enable either motor family or publish any
     // target until the operator has made an explicit post-start enable edge,
     // both steering positions are known, and the real CAN sender is present.
-    if (!startup_interlock_released ||
-        !steer_front_feedback_seen_ || !steer_rear_feedback_seen_ ||
-        !can_sender_ready) {
+    if (!startup_interlock_released || !can_sender_ready) {
+      state_.v_front = state_.v_rear = 0.0;
+      return;
+    }
+    if (fault_latch_.latched() != 0) {
+      state_.v_front = state_.v_rear = 0.0;
+      if (recovery_requested_) service_transport_recovery(now_ms);
+      else if (actuation_ever_started_) publish_zero_wheels();
+      return;
+    }
+    if (!steering_feedback_fresh(now_ms)) {
+      state_.v_front = state_.v_rear = 0.0;
+      if (actuation_ever_started_) publish_zero_wheels();
+      stop_reason_ = "waiting_steering_feedback";
       return;
     }
 
@@ -558,6 +671,9 @@ class Agv2Control : public rclcpp::Node {
     if (!steering_brought_up_) {
       bring_up_steering();
       steering_brought_up_ = true;
+      actuation_ever_started_ = true;
+      state_.v_front = state_.v_rear = 0.0;
+      stop_reason_ = "steering_bringup";
       return;
     }
 
@@ -583,10 +699,26 @@ class Agv2Control : public rclcpp::Node {
         can_sender_ready, now_ms);
 
     if (front_ready && rear_ready) {
+      hardware_monitor_armed_ = true;
       const double vf = locked ? 0.0 : state_.v_front;
       const double vr = locked ? 0.0 : state_.v_rear;
       can_pub_->publish(encode_wheel_velocity(can_ids_.wheel_front, vf, dirs_.front, wheel_lim_));
       can_pub_->publish(encode_wheel_velocity(can_ids_.wheel_rear,  vr, dirs_.rear,  wheel_lim_));
+    } else {
+      // Reset the limiter while no valid output is possible. Also stop the
+      // healthy wheel explicitly; silence must never be used as a stop command.
+      state_.v_front = state_.v_rear = 0.0;
+      if (front_ready) can_pub_->publish(encode_wheel_velocity(
+          can_ids_.wheel_front, 0.0, dirs_.front, wheel_lim_));
+      if (rear_ready) can_pub_->publish(encode_wheel_velocity(
+          can_ids_.wheel_rear, 0.0, dirs_.rear, wheel_lim_));
+      // The not-ready drive already received its zero-target bring-up
+      // controlword. Do not overwrite switch-on/enable with shutdown here.
+      if (wheel_front_status_.fault || wheel_front_status_.error_code != 0)
+        can_pub_->publish(encode_wheel_controlword(can_ids_.wheel_front, 0));
+      if (wheel_rear_status_.fault || wheel_rear_status_.error_code != 0)
+        can_pub_->publish(encode_wheel_controlword(can_ids_.wheel_rear, 0));
+      stop_reason_ = "waiting_wheel_bringup";
     }
   }
 
@@ -658,22 +790,271 @@ class Agv2Control : public rclcpp::Node {
         });
   }
 
+  enum Fault : uint32_t {
+    CanSenderMissing = 1u, FrontWheelTimeout = 2u, RearWheelTimeout = 4u,
+    FrontSteerTimeout = 8u, RearSteerTimeout = 16u, FrontWheelFault = 32u,
+    RearWheelFault = 64u, SteeringMismatch = 128u, InvalidInput = 256u,
+    FrontWheelDisabled = 512u, RearWheelDisabled = 1024u, TransportRecovery = 2048u
+  };
+
+  void stop_motion(const char* reason) {
+    mode_ = Mode::Idle;
+    fsm_->on_lock_request();
+    arbitrator_->reset();
+    active_source_ = ActiveSource::None;
+    state_.v_front = state_.v_rear = 0.0;
+    stop_reason_ = reason;
+  }
+
+  void reject_input(uint32_t source, const char* reason, bool controlling) {
+    invalid_sources_ |= source;
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "%s", reason);
+    if (controlling) {
+      fault_latch_.update(fault_latch_.active() | InvalidInput);
+      stop_motion("invalid_input");
+      last_diagnostic_ms_ = -1;
+    }
+  }
+
+  bool wheel_feedback_fresh(const WheelBringupState& wheel, int64_t now_ms) const {
+    return wheel.status_seen && now_ms >= wheel.last_status_ms &&
+        now_ms - wheel.last_status_ms <= std::min(
+            diagnostic_cfg_.wheel_feedback_timeout_ms, bringup_cfg_.status_stale_ms);
+  }
+
+  bool steering_feedback_fresh(int64_t now_ms) const {
+    return steer_front_feedback_seen_ && steer_rear_feedback_seen_ &&
+        now_ms - steer_front_feedback_ms_ <= diagnostic_cfg_.steer_feedback_timeout_ms &&
+        now_ms - steer_rear_feedback_ms_ <= diagnostic_cfg_.steer_feedback_timeout_ms;
+  }
+
+  uint32_t current_faults(bool recovery = false) {
+    const auto now_ms = now_steady_ms();
+    uint32_t flags = invalid_sources_ != 0 ? InvalidInput : 0u;
+    if (recovery_requested_) flags |= TransportRecovery;
+    if (startup_interlock_released_ || recovery) {
+      if (wheel_front_status_.fault || wheel_front_status_.error_code != 0) flags |= FrontWheelFault;
+      if (wheel_rear_status_.fault || wheel_rear_status_.error_code != 0) flags |= RearWheelFault;
+    }
+    if (!hardware_monitor_armed_ && !recovery) return flags;
+    if (!can_sender_ready_for_bringup()) flags |= CanSenderMissing;
+    const bool front_fresh = wheel_feedback_fresh(wheel_front_bringup_, now_ms);
+    const bool rear_fresh = wheel_feedback_fresh(wheel_rear_bringup_, now_ms);
+    if (safety_.feedback_stop_enabled || recovery) {
+      if (!front_fresh) flags |= FrontWheelTimeout;
+      if (!rear_fresh) flags |= RearWheelTimeout;
+      if (!steer_front_feedback_seen_ ||
+          now_ms - steer_front_feedback_ms_ > diagnostic_cfg_.steer_feedback_timeout_ms)
+        flags |= FrontSteerTimeout;
+      if (!steer_rear_feedback_seen_ ||
+          now_ms - steer_rear_feedback_ms_ > diagnostic_cfg_.steer_feedback_timeout_ms)
+        flags |= RearSteerTimeout;
+    }
+    if (wheel_front_status_.fault || wheel_front_status_.error_code != 0) flags |= FrontWheelFault;
+    if (wheel_rear_status_.fault || wheel_rear_status_.error_code != 0) flags |= RearWheelFault;
+    if (!recovery) {
+      if (front_fresh && (!wheel_front_status_.ready || !wheel_front_status_.switched_on ||
+                          !wheel_front_status_.enabled)) flags |= FrontWheelDisabled;
+      if (rear_fresh && (!wheel_rear_status_.ready || !wheel_rear_status_.switched_on ||
+                         !wheel_rear_status_.enabled)) flags |= RearWheelDisabled;
+    }
+    const bool mismatch = steering_feedback_fresh(now_ms) &&
+        (std::fabs(steer_error_deg(state_.theta_front, steer_front_fb_deg_)) >= diagnostic_cfg_.steer_mismatch_deg ||
+         std::fabs(steer_error_deg(state_.theta_rear, steer_rear_fb_deg_)) >= diagnostic_cfg_.steer_mismatch_deg);
+    if (safety_.steer_error_stop_enabled && mismatch) {
+      if (steer_mismatch_since_ms_ < 0) steer_mismatch_since_ms_ = now_ms;
+      if (recovery || now_ms - steer_mismatch_since_ms_ >= safety_.steer_error_stop_ms)
+        flags |= SteeringMismatch;
+    } else {
+      steer_mismatch_since_ms_ = -1;
+    }
+    return flags;
+  }
+
+  static std::string fault_description(uint32_t flags) {
+    std::string result;
+    const std::pair<uint32_t, const char*> reasons[] = {
+        {CanSenderMissing, "can_sender_missing"}, {FrontWheelTimeout, "front_wheel_timeout"},
+        {RearWheelTimeout, "rear_wheel_timeout"}, {FrontSteerTimeout, "front_steer_timeout"},
+        {RearSteerTimeout, "rear_steer_timeout"}, {FrontWheelFault, "front_wheel_fault"},
+        {RearWheelFault, "rear_wheel_fault"}, {SteeringMismatch, "steering_mismatch"},
+        {InvalidInput, "invalid_input"}, {FrontWheelDisabled, "front_wheel_disabled"},
+        {RearWheelDisabled, "rear_wheel_disabled"}, {TransportRecovery, "transport_recovery"}};
+    for (const auto& reason : reasons) {
+      if ((flags & reason.first) == 0) continue;
+      if (!result.empty()) result += ",";
+      result += reason.second;
+    }
+    return result.empty() ? "none" : result;
+  }
+
+  void update_fault_state() {
+    const auto previous = fault_latch_.latched();
+    // Before the first enable, malformed inputs are rejected/reported but do
+    // not energize hardware or latch an otherwise passive startup.
+    const auto flags = current_faults();
+    if (startup_interlock_released_ || previous != 0) fault_latch_.update(flags);
+    if (fault_latch_.latched() != 0) {
+      stop_motion("fault_latched");
+      if (previous != fault_latch_.latched()) {
+        RCLCPP_ERROR(get_logger(), "Motion inhibited: %s; resolve then call agv2/reset_faults and re-enable.",
+                     fault_description(fault_latch_.latched()).c_str());
+        last_diagnostic_ms_ = -1;
+      }
+    }
+  }
+
+  void reset_faults(std_srvs::srv::Trigger::Response& response) {
+    if (shutdown_prepared_ || g_shutdown_requested.load() || joy_gate_.emergency_active()) {
+      response.success = false;
+      response.message = "cannot reset during shutdown or while software emergency is held";
+      return;
+    }
+    if (mode_ != Mode::Idle) {
+      response.success = false;
+      response.message = "lock the chassis before resetting faults";
+      return;
+    }
+    // Explicit acknowledgement discards an invalid command session, including
+    // one whose publisher has exited. A continuing bad publisher is rejected
+    // again, and reset never restores motion permission.
+    const uint32_t unresolved = current_faults(true) & ~static_cast<uint32_t>(InvalidInput);
+    if (unresolved != 0) {
+      response.success = false;
+      response.message = "faults still active: " + fault_description(unresolved);
+      return;
+    }
+    fault_latch_.update(0);
+    fault_latch_.clear();
+    invalid_sources_ = 0;
+    cmd_vx_ = cmd_vy_ = cmd_omega_ = 0.0;
+    wheel_cmd_target_ = {};
+    joy_target_ = {};
+    stop_motion("faults_cleared_reenable_required");
+    hardware_monitor_armed_ = false;
+    startup_interlock_released_ = false;
+    steering_brought_up_ = false;
+    reset_wheel_bringup(wheel_front_bringup_);
+    reset_wheel_bringup(wheel_rear_bringup_);
+    response.success = true;
+    response.message = "host faults cleared; hardware fault reset was NOT sent; a new enable edge is required";
+    RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
+    publish_diagnostics(true);
+  }
+
+  void service_transport_recovery(int64_t now_ms) {
+    // Explicit recovery configures communication only. It must not perform the
+    // normal 0x07 -> 0x0f enable sequence or publish nonzero targets.
+    can_pub_->publish(encode_wheel_controlword(can_ids_.wheel_front, 0));
+    can_pub_->publish(encode_wheel_controlword(can_ids_.wheel_rear, 0));
+    if (now_ms - recovery_started_ms_ > 5000) {
+      recovery_requested_ = false;
+      recovery_status_ = "timeout_kept_locked";
+      RCLCPP_ERROR(get_logger(), "Transport recovery timed out; chassis remains locked.");
+      return;
+    }
+    if (wheel_feedback_fresh(wheel_front_bringup_, now_ms) &&
+        wheel_feedback_fresh(wheel_rear_bringup_, now_ms) && steering_feedback_fresh(now_ms)) {
+      recovery_requested_ = false;
+      recovery_status_ = "feedback_received_reset_required";
+      return;
+    }
+    const auto retry = [this, now_ms](WheelBringupState& tracking,
+                                    const WheelStatus& status, uint32_t id, uint8_t node_id) {
+      if (wheel_feedback_fresh(tracking, now_ms) || status.fault || status.error_code != 0) return;
+      if (tracking.last_sdo_ms >= 0 && now_ms - tracking.last_sdo_ms < bringup_cfg_.sdo_retry_period_ms) return;
+      for (const auto& frame : encode_wheel_sdo_init(id, node_id)) can_pub_->publish(frame);
+      tracking.last_sdo_ms = now_ms;
+      ++tracking.sdo_retry_count;
+    };
+    retry(wheel_front_bringup_, wheel_front_status_, can_ids_.sdo_front, can_ids_.front_node_id);
+    retry(wheel_rear_bringup_, wheel_rear_status_, can_ids_.sdo_rear, can_ids_.rear_node_id);
+  }
+
+  void publish_zero_wheels() {
+    const auto now_ms = now_steady_ms();
+    const auto zero = [this, now_ms](uint32_t id, int direction, const WheelStatus& status,
+                                   const WheelBringupState& tracking) {
+      // Never use an enable-operation velocity frame to re-enable a known
+      // disabled/faulted drive. The healthy wheel still receives explicit zero.
+      if (wheel_feedback_fresh(tracking, now_ms) && status.present && status.ready && status.switched_on && status.enabled &&
+          !status.fault && status.error_code == 0) {
+        can_pub_->publish(encode_wheel_velocity(id, 0.0, direction, wheel_lim_));
+      } else {
+        can_pub_->publish(encode_wheel_controlword(id, 0));
+      }
+    };
+    zero(can_ids_.wheel_front, dirs_.front, wheel_front_status_, wheel_front_bringup_);
+    zero(can_ids_.wheel_rear, dirs_.rear, wheel_rear_status_, wheel_rear_bringup_);
+  }
+
+  bool wait_for_can_delivery() {
+    try {
+      return can_pub_->wait_for_all_acked(std::chrono::milliseconds(500));
+    } catch (const std::exception& error) {
+      RCLCPP_ERROR(get_logger(), "DDS delivery confirmation failed: %s", error.what());
+      return false;
+    }
+  }
+
+  void publish_diagnostics(bool force = false) {
+    const auto now_ms = now_steady_ms();
+    if (!force && last_diagnostic_ms_ >= 0 && now_ms - last_diagnostic_ms_ < diagnostic_period_ms_) return;
+    last_diagnostic_ms_ = now_ms;
+    diagnostic_msgs::msg::DiagnosticArray array;
+    array.header.stamp = now();
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = std::string(get_fully_qualified_name()) + "/control";
+    status.hardware_id = hardware_id_;
+    status.level = fault_latch_.latched() != 0 ? diagnostic_msgs::msg::DiagnosticStatus::ERROR :
+        (stop_reason_ == "running" || shutdown_prepared_ ? diagnostic_msgs::msg::DiagnosticStatus::OK :
+                                                       diagnostic_msgs::msg::DiagnosticStatus::WARN);
+    status.message = fault_latch_.latched() != 0 ? fault_description(fault_latch_.latched()) : stop_reason_;
+    const auto add = [&status](const std::string& key, const std::string& value) {
+      diagnostic_msgs::msg::KeyValue entry;
+      entry.key = key;
+      entry.value = value;
+      status.values.push_back(entry);
+    };
+    add("active_faults", std::to_string(current_faults()));
+    add("latched_faults", std::to_string(fault_latch_.latched()));
+    add("stop_reason", shutdown_prepared_ ? "shutdown_prepared" : stop_reason_);
+    add("can_sender_ready", can_sender_ready_for_bringup() ? "true" : "false");
+    add("startup_interlock_released", startup_interlock_released_ ? "true" : "false");
+    add("hardware_monitor_armed", hardware_monitor_armed_ ? "true" : "false");
+    add("software_emergency", joy_gate_.emergency_active() ? "true" : "false");
+    add("invalid_input_sources", std::to_string(invalid_sources_));
+    add("transport_recovery", recovery_status_);
+    add("front_wheel_feedback_age_ms", std::to_string(feedback_age_ms(
+        wheel_front_bringup_.status_seen, wheel_front_bringup_.last_status_ms, now_ms)));
+    add("rear_wheel_feedback_age_ms", std::to_string(feedback_age_ms(
+        wheel_rear_bringup_.status_seen, wheel_rear_bringup_.last_status_ms, now_ms)));
+    add("front_steer_feedback_age_ms", std::to_string(feedback_age_ms(
+        steer_front_feedback_seen_, steer_front_feedback_ms_, now_ms)));
+    add("rear_steer_feedback_age_ms", std::to_string(feedback_age_ms(
+        steer_rear_feedback_seen_, steer_rear_feedback_ms_, now_ms)));
+    add("front_wheel_error_code", std::to_string(wheel_front_status_.error_code));
+    add("rear_wheel_error_code", std::to_string(wheel_rear_status_.error_code));
+    add("front_sdo_retries", std::to_string(wheel_front_bringup_.sdo_retry_count));
+    add("rear_sdo_retries", std::to_string(wheel_rear_bringup_.sdo_retry_count));
+    const char* domain = std::getenv("ROS_DOMAIN_ID");
+    add("ros_domain_id", domain ? domain : "0");
+    array.status.push_back(status);
+    diagnostics_pub_->publish(array);
+  }
+
   uint32_t declare_can_id_parameter(const char* name, uint32_t default_value) {
     const int value = declare_parameter<int>(name, static_cast<int>(default_value));
-    if (value < 0) {
-      RCLCPP_WARN(get_logger(), "Invalid negative CAN id for %s; using 0x%03x.",
-                  name, static_cast<unsigned int>(default_value));
-      return default_value;
+    if (value <= 0 || value > 0x7ff) {
+      throw std::invalid_argument(std::string(name) + " must be a nonzero standard CAN ID (1..2047)");
     }
     return static_cast<uint32_t>(value);
   }
 
   uint8_t declare_node_id_parameter(const char* name, uint8_t default_value) {
     const int value = declare_parameter<int>(name, static_cast<int>(default_value));
-    if (value < 0 || value > 255) {
-      RCLCPP_WARN(get_logger(), "Invalid CANopen node id for %s; using 0x%02x.",
-                  name, static_cast<unsigned int>(default_value));
-      return default_value;
+    if (value < 1 || value > 127) {
+      throw std::invalid_argument(std::string(name) + " must be a CANopen node ID (1..127)");
     }
     return static_cast<uint8_t>(value);
   }
@@ -927,6 +1308,9 @@ class Agv2Control : public rclcpp::Node {
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr lock_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr prepare_shutdown_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_faults_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reinitialize_srv_;
 
   // -------- config --------
   WheelGeometry geom_{};
@@ -970,6 +1354,28 @@ class Agv2Control : public rclcpp::Node {
   } joy_{};
 
   // -------- runtime state --------
+  struct SafetyConfig {
+    bool feedback_stop_enabled{true};
+    bool steer_alignment_enabled{false};
+    double steer_alignment_max_error_deg{15.0};
+    bool steer_error_stop_enabled{false};
+    int64_t steer_error_stop_ms{1000};
+    bool hold_steering_on_teleop_stop{false};
+  } safety_;
+  std::unique_ptr<CommandArbitrator> arbitrator_;
+  JoyEnableGate joy_gate_;
+  FaultLatch fault_latch_;
+  uint32_t invalid_sources_{0};
+  bool hardware_monitor_armed_{false};
+  bool actuation_ever_started_{false};
+  bool recovery_requested_{false};
+  int64_t recovery_started_ms_{-1};
+  std::string recovery_status_{"not_requested"};
+  int64_t steer_mismatch_since_ms_{-1};
+  int64_t last_diagnostic_ms_{-1};
+  int64_t diagnostic_period_ms_{200};
+  std::string hardware_id_{"agv"};
+  std::string stop_reason_{"startup_interlock"};
   std::unique_ptr<StateMachine> fsm_;
   Mode mode_{Mode::Idle};
   ActiveSource active_source_{ActiveSource::None};
@@ -982,8 +1388,6 @@ class Agv2Control : public rclcpp::Node {
   Clock::time_point last_cmd_vel_t_{};
   Clock::time_point last_wheel_cmd_t_{};
   Clock::time_point last_joy_t_{};
-
-  struct JoyPrev { bool emergency{false}, enable{false}, ad{false}; } joy_prev_;
 
   // Last commanded wheel state (post rate-limit).
   LimiterState state_{0.0, 0.0, 0.0, 0.0};
@@ -1013,7 +1417,6 @@ class Agv2Control : public rclcpp::Node {
 
   bool steering_brought_up_{false};
   bool startup_interlock_released_{false};
-  bool joy_edges_initialized_{false};
   bool shutdown_processed_{false};
   bool shutdown_prepared_{false};
 };

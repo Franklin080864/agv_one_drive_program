@@ -1,5 +1,9 @@
 # agv2_pkg
 
+> `develop` 的稳定性改进、兼容开关、错误码、部署及实车验收见
+> [DEVELOPMENT.md](DEVELOPMENT.md)。新启动脚本需要显式 `--domain-id`；
+> 运行故障恢复后需要人工复位与新的使能。下文原控制说明中的硬件映射保持不变。
+
 > 实车部署入口见 [DEPLOYMENT.md](DEPLOYMENT.md)。部署脚本强制使用显式外置
 > 参数文件，避免账户路径变化或安装空间中的旧配置影响实车行为。
 
@@ -15,7 +19,7 @@
   `angular.z`，每个舵轮按自身位置计算目标舵角和轮速。
 - 轮速有软件斜坡限制；舵角不做软件斜坡，直接下发目标角，实际转向速度由
   转向电机 `0xa4` 帧里的速度字段控制。
-- 当前最大风险不是 CAN codec，而是实车几何参数和上游话题迁移：
+- 实车几何参数和上游话题迁移仍需按本车验证：
   旧的 `steering_commands` 不再被订阅，上游需要改发 `/cmd_vel` 或
   `/wheel_command`，或者补桥接节点。
 - `config/chassis.yaml` 里的 `wheel_spd_up_button` 和
@@ -24,6 +28,7 @@
 ## 构建与运行
 
 ```bash
+export ROS_DOMAIN_ID=11  # 本车示例值；所有本车终端使用相同值
 colcon build --packages-select agv2_pkg
 source install/setup.bash
 ros2 launch agv2_pkg agv2_control.launch.py
@@ -85,7 +90,7 @@ ros2 launch agv2_pkg agv2_control.launch.py \
 部署启动脚本要求显式传入配置；底盘2可以这样启动：
 
 ```bash
-sudo ./deploy/start_agv.sh "$PWD/config/chassis_robot2.yaml"
+sudo ./deploy/start_agv.sh --domain-id 12 "$PWD/config/chassis_robot2.yaml"
 ```
 
 ## ROS 接口
@@ -152,7 +157,7 @@ Auto 模式下 `/cmd_vel` 和 `/wheel_command` 是会话式互斥：先到的源
 
 输入新鲜度分两层：
 
-- `fsm.cmd_watchdog_ms` 默认 200 ms：当前有效输入超过这个时间没更新，轮速开始斜坡降到 0。
+- `fsm.cmd_watchdog_ms` 默认 200 ms：当前获选输入超过这个时间没更新，轮速开始斜坡降到 0；其他来源不会刷新它。
 - `arbitrator.input_timeout_ms` 默认 1000 ms：控制源超过这个时间没更新，才释放会话控制权。
 
 ## 重要参数

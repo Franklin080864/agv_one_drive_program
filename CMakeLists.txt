@@ -17,6 +17,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(can_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -36,6 +37,7 @@ add_library(${PROJECT_NAME}_core
   src/can_codec.cpp
   src/teleop.cpp
   src/wheel_bringup.cpp
+  src/control_safety.cpp
 )
 target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -53,6 +55,7 @@ ament_target_dependencies(agv2_control_node
   std_msgs
   std_srvs
   can_msgs
+  diagnostic_msgs
 )
 
 install(TARGETS agv2_control_node
@@ -78,6 +81,7 @@ install(PROGRAMS
   scripts/agv_auto_bridge.py
   scripts/analyze_chassis_bag.py
   scripts/chassis_fault_snapshot.py
+  scripts/prepare_chassis_shutdown.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -100,6 +104,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_wheel_bringup test/test_wheel_bringup.cpp)
   target_link_libraries(test_wheel_bringup ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_control_safety test/test_control_safety.cpp)
+  target_link_libraries(test_control_safety ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_fsm test/test_fsm.cpp)
+  target_link_libraries(test_fsm ${PROJECT_NAME}_core)
 endif()
 
 ament_package()
