@@ -41,6 +41,8 @@
 - `/agv2/reinitialize_transport`：人工请求通信恢复；只发送零目标 shutdown 控制字和限频 SDO/NMT，不发送使能序列。
 - `/agv2/prepare_shutdown`：发送最终停车帧并等待 DDS 层确认。
 
+`shutdown.ack_timeout_ms` 默认 4000 ms（有效范围 1–60000 ms）。Humble 所用 Fast DDS 的默认可靠通信心跳为 3 秒，500 ms 可能把已收到的消息误判为未确认。停车帧在等待前立即发送；超时或中间件不支持确认时返回失败并保持控制锁定。此确认仅覆盖 DDS 接收，不能证明 CAN 已发送或轮子已停。若增大该参数，应同步增大停机脚本的 `AGV_SHUTDOWN_TIMEOUT_S`，为发现服务和响应留出余量。参考 [Fast DDS WriterTimes](https://fast-dds.docs.eprosima.com/en/2.6.x/fastdds/dds_layer/core/policy/eprosimaExtensions.html#writertimes)。
+
 `active_faults` 与 `latched_faults` 是十进制位掩码，`DiagnosticStatus.message` 同时提供可读名称：
 
 | 位值 | 名称 |

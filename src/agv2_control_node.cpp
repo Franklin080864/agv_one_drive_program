@@ -337,10 +337,13 @@ class Agv2Control : public rclcpp::Node {
         "safety.hold_steering_on_teleop_stop", false);
     diagnostic_period_ms_ = declare_ms_parameter("diagnostics.publish_period_ms", 200);
     hardware_id_ = declare_parameter<std::string>("diagnostics.hardware_id", "agv");
+    shutdown_ack_timeout_ms_ = declare_ms_parameter("shutdown.ack_timeout_ms", 4000);
 
     const auto require = [](bool valid, const char* message) {
       if (!valid) throw std::invalid_argument(message);
     };
+    require(shutdown_ack_timeout_ms_ > 0 && shutdown_ack_timeout_ms_ <= 60000,
+            "shutdown.ack_timeout_ms must be 1..60000");
     require(all_finite({geom_.front_x, geom_.front_y, geom_.rear_x, geom_.rear_y}) &&
             std::hypot(geom_.front_x - geom_.rear_x, geom_.front_y - geom_.rear_y) > 1e-6,
             "chassis wheel positions must be finite and distinct");
@@ -990,7 +993,16 @@ class Agv2Control : public rclcpp::Node {
 
   bool wait_for_can_delivery() {
     try {
-      return can_pub_->wait_for_all_acked(std::chrono::milliseconds(500));
+      // Humble's Fast DDS can wait for its periodic (default 3 s) heartbeat
+      // before acknowledging the final samples. 500 ms causes false failures
+      // even when the CAN sender has already received those samples.
+      const bool acknowledged = can_pub_->wait_for_all_acked(
+          std::chrono::milliseconds(shutdown_ack_timeout_ms_));
+      if (!acknowledged) {
+        RCLCPP_ERROR(get_logger(), "DDS delivery confirmation timed out after %lld ms.",
+                     static_cast<long long>(shutdown_ack_timeout_ms_));
+      }
+      return acknowledged;
     } catch (const std::exception& error) {
       RCLCPP_ERROR(get_logger(), "DDS delivery confirmation failed: %s", error.what());
       return false;
@@ -1374,6 +1386,7 @@ class Agv2Control : public rclcpp::Node {
   int64_t steer_mismatch_since_ms_{-1};
   int64_t last_diagnostic_ms_{-1};
   int64_t diagnostic_period_ms_{200};
+  int64_t shutdown_ack_timeout_ms_{4000};
   std::string hardware_id_{"agv"};
   std::string stop_reason_{"startup_interlock"};
   std::unique_ptr<StateMachine> fsm_;

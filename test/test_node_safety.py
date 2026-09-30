@@ -78,7 +78,7 @@ class TestNodeSafety(unittest.TestCase):
         if self.process is not None and self.process.poll() is None:
             self.process.send_signal(signal.SIGINT)
             try:
-                self.process.wait(timeout=3.0)
+                self.process.wait(timeout=7.0)
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=3.0)
@@ -165,8 +165,12 @@ class TestNodeSafety(unittest.TestCase):
         self.log.flush()
         self.log.seek(0)
         log_tail = self.log.read().decode("utf-8", errors="replace")[-6000:]
+        frame_tail = [(hex(frame.id), bytes(frame.data).hex())
+                      for _, frame in self.can_frames[-20:]]
         return ("\nlast telemetry: " + str(self.latest) +
-                "\ndiagnostics: " + str(self.diagnostics) + "\ndriver log:\n" + log_tail)
+                "\ndiagnostics: " + str(self.diagnostics) +
+                "\nlast received CAN frames: " + str(frame_tail) +
+                "\ndriver log:\n" + log_tail)
 
     def _until(self, predicate, timeout=5.0, description="condition"):
         deadline = time.monotonic() + timeout
@@ -228,7 +232,7 @@ class TestNodeSafety(unittest.TestCase):
     def _service(self, client):
         self._until(client.service_is_ready, description="service availability")
         future = client.call_async(Trigger.Request())
-        self._until(future.done, timeout=5.0, description="service response")
+        self._until(future.done, timeout=6.0, description="service response")
         result = future.result()
         self.assertIsNotNone(result)
         return result
@@ -409,7 +413,7 @@ class TestNodeSafety(unittest.TestCase):
         self._start_moving()
         start = time.monotonic()
         response = self._service(self.shutdown_client)
-        self.assertTrue(response.success, response.message)
+        self.assertTrue(response.success, response.message + self._failure_context())
         self._until(lambda: any(stamp >= start and frame.id == 0x001 and
                                 bytes(frame.data) == bytes([0xFF] * 7 + [0xFD])
                                 for stamp, frame in self.can_frames) and
